@@ -1,4 +1,9 @@
-node_modules/
+# Python compiled files
+__pycache__/
+*.pyc
+
+# Generated data files
+latency_probe/data/node_modules/
 .next/
 dist/
 build/
