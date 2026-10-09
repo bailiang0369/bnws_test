@@ -36,6 +36,9 @@ import sys
 from collections import defaultdict
 from statistics import median, mean
 
+args_tick = None    # 由 --tick-size 设置，供 pair_by_level_jump 使用
+args_level_tol = 3.0  # 由 --level-tol 设置
+
 
 def load(path):
     msgs = {"spot": [], "futures": []}
@@ -59,6 +62,10 @@ def load(path):
                 clocks[r["market"]].append(r)
             elif t == "meta":
                 meta = r
+    stream = (meta or {}).get("stream", "")
+    for mk in msgs:
+        for rec in msgs[mk]:
+            rec["stream"] = stream
     for m in msgs.values():
         m.sort(key=lambda x: x["t_mono"])
     return msgs, clocks, meta
@@ -76,6 +83,8 @@ def median_offset(clocks):
 
 def pair_exact(spot, fut):
     """level-1: ev_us 完全相等的配对（现货微秒戳恰好等于合约毫秒戳×1000）。"""
+    spot = [r for r in spot if r.get("ev_us") is not None]
+    fut = [r for r in fut if r.get("ev_us") is not None]
     fmap = defaultdict(list)
     for r in fut:
         fmap[r["ev_us"]].append(r)
@@ -97,6 +106,8 @@ def pair_exact(spot, fut):
 
 def pair_nearest(spot, fut, tol_us):
     """level-2: 双指针最近邻匹配，|Δev|<=tol 且每个点最多用一次（贪心，按现货序扫描）。"""
+    spot = [r for r in spot if r.get("ev_us") is not None]
+    fut = [r for r in fut if r.get("ev_us") is not None]
     pairs = []
     j = 0
     used_f = set()
@@ -140,43 +151,87 @@ def pair_trades(spot, fut):
     return pairs
 
 
-def pair_by_price(spot, fut, max_gap_ms=500.0):
-    """口径B：以"买价变化时刻"(b 字段跳变)作为同一市场事件的代理锚点对齐。
+def pair_by_level_jump(spot, fut, max_gap_ms=500.0):
+    """口径B（事件锚点对齐）：把"最优买价档位跳变"当作同一笔市场冲击在两个市场的响应。
 
-    bookTicker 两市场时间戳各自独立生成（现货 bookTicker 甚至不带时间戳），
-    无法精确配对；但一次真实的盘口变动会先后反映到两个市场的买价上。
-    对每次现货 b 跳变，找其后 max_gap 内第一次合约 b 跳到同一价格的推送，
-    两条到达时刻(t_mono)之差即"同一事件的两市场到达差"。每个点最多用一次。
+    为什么不能按"同一时间戳/同一价格值"配对（实测结论）：
+      1) 现货 bookTicker **完全不携带时间戳字段**（只有 u,s,b,B,a,A），合约才有 E/T；
+         所以"同一时间戳"这个提法对 bookTicker 从定义上就不成立，只能用 trade 流。
+      2) 两市场小数位不同（现货 83162.00000000 vs 合约 83125.10）、且是两套独立订单簿、
+         存在基差，绝对价位不重合 —— 按价格字符串或绝对价位匹配恒为 n=0。
+
+    做法：两侧 best bid 各按 tick_size 量化成整数档位，取档位变化推送为"事件"，
+    用该跳变的**相对位置 z-score**（各自序列内标准化，跨市场可比）与方向作为锚点特征：
+        |z_spot - z_fut| <= level_tol(σ) 且 跳变方向一致 且 到达时刻差 <= max_gap_ms
+    即认为是同一冲击的双市响应，两者到达时刻之差就是两市时滞。每个点最多用一次。
+    实现上用"z 分桶 + 时间窗"索引，复杂度近似 O(n)，避免两两扫描。
     """
-    def jumps(stream):
+    sj_raw = [(r, float(r["b"])) for r in spot if r.get("b") is not None]
+    fj_raw = [(r, float(r["b"])) for r in fut if r.get("b") is not None]
+    if len(sj_raw) < 10 or len(fj_raw) < 10:
+        return []
+
+    # ---- tick_size：默认用币安 BTCUSDT 现货/合约共同的 0.01（也可 --tick-size 覆盖）----
+    tick = args_tick if args_tick else 0.01
+
+    def stats(vals):
+        m = mean(vals)
+        sd = (sum((x - m) ** 2 for x in vals) / len(vals)) ** 0.5
+        return m, (sd if sd > 1e-9 else 1.0)
+
+    sv = [v for _, v in sj_raw]
+    fv = [v for _, v in fj_raw]
+    sm, ss_ = stats(sv)
+    fm, fs_ = stats(fv)
+
+    def jumps(stream, mu, sd):
         out, prev = [], None
-        for r in stream:
-            if r.get("b") is not None and r["b"] != prev:
-                out.append(r)
-                prev = r["b"]
+        for r, v in stream:
+            lv = int(round(v / tick))
+            if prev is None or lv != prev:
+                out.append({"rec": r, "lv": lv, "prev": prev,
+                            "z": (lv * tick - mu) / sd,
+                            "t": r["t_mono"]})
+                prev = lv
         return out
 
-    sj, fj = jumps(spot), jumps(fut)
-    f_by_price = defaultdict(list)
-    for i, r in enumerate(fj):
-        f_by_price[r["b"]].append(i)
+    sj, fj = jumps(sj_raw, sm, ss_), jumps(fj_raw, fm, fs_)
+    print(f"   [口径B] tick={tick:g}, 事件数: 现货跳变 {len(sj)} / 合约跳变 {len(fj)}, "
+          f"z 容差 {args_level_tol:g}σ, 时间窗 {max_gap_ms:g}ms")
+
+    # z 分桶索引（桶宽 = level_tol），只查相邻桶 -> 近似 O(n)
+    from collections import defaultdict as _dd
+    width = max(args_level_tol, 1e-6)
+    buckets = _dd(list)
+    for i, e in enumerate(fj):
+        buckets[int(e["z"] / width)].append(i)
+
     used_f, pairs = set(), []
-    ptr = defaultdict(int)          # 每价格一个游标，保证整体近似 O(n)
-    for s in sj:
-        lst = f_by_price.get(s["b"])
-        if not lst:
+    for e in sj:
+        if e["prev"] is None:
             continue
-        p = ptr[s["b"]]
-        while p < len(lst) and (fj[lst[p]]["t_mono"] <= s["t_mono"] or
-                                (fj[lst[p]]["t_mono"] - s["t_mono"]) * 1000.0 > max_gap_ms):
-            p += 1
-        ptr[s["b"]] = p
-        if p < len(lst):
-            i = lst[p]
-            if i not in used_f:
-                used_f.add(i)
-                ptr[s["b"]] = p + 1
-                pairs.append((s, fj[i]))
+        down = e["lv"] < e["prev"]
+        b = int(e["z"] / width)
+        cand_idx = []
+        for k in (b - 1, b, b + 1):
+            cand_idx.extend(buckets.get(k, ()))
+        best_i, best_d = None, None
+        for i in cand_idx:
+            if i in used_f:
+                continue
+            f = fj[i]
+            if f["prev"] is None or (f["lv"] < f["prev"]) != down:
+                continue
+            dt = abs(f["t"] - e["t"])
+            if dt * 1000.0 > max_gap_ms:
+                continue
+            if abs(f["z"] - e["z"]) > args_level_tol:
+                continue
+            if best_d is None or dt < best_d:
+                best_i, best_d = i, dt
+        if best_i is not None:
+            used_f.add(best_i)
+            pairs.append((e["rec"], fj[best_i]["rec"]))
     return pairs
 
 
@@ -222,7 +277,14 @@ def main():
                     help="重连分段最小间隔(秒)：两条流接收时刻差超过该值视为不同连接段，剔除跨段配对")
     ap.add_argument("--max-event-gap-ms", type=float, default=500.0,
                     help="口径B：现货买价跳变后允许合约跟到的最大事件间隔(毫秒)")
+    ap.add_argument("--tick-size", type=float, default=None,
+                    help="口径B：价格最小变动单位（默认自动估计）")
+    ap.add_argument("--level-tol", type=float, default=0.5,
+                    help="口径B：两市场跳变位置的 z-score(σ) 对齐容差，默认0.5")
+    global args_tick, args_level_tol
     args = ap.parse_args()
+    args_tick = args.tick_size
+    args_level_tol = args.level_tol
 
     msgs, clocks, meta = load(args.jsonl)
     off = median_offset(clocks)
@@ -275,9 +337,14 @@ def main():
                 continue
             a = [r for r in ss if lo <= r["t_mono"] <= hi]
             b = [r for r in fs if lo <= r["t_mono"] <= hi]
-            p_pairs += pair_by_price(a, b, max_gap_ms=args.max_event_gap_ms)
+            p_pairs += pair_by_level_jump(a, b, max_gap_ms=args.max_event_gap_ms)
 
-    report(ts_pairs, "口径A(时间戳最近邻匹配)", off, thr=args.gap_threshold)
+    if ts_pairs:
+        report(ts_pairs, "口径A(时间戳最近邻匹配)", off, thr=args.gap_threshold)
+    else:
+        print("\n===== 口径A(时间戳最近邻匹配): 不适用 =====")
+        print("   现货 bookTicker 不携带任何时间戳字段(ev_us=None)，两市场之间不存在“同一时间戳”可言；")
+        print("   若需严格的时间戳配对，请用 --streams trade（两侧 T=成交毫秒戳可精确对齐）。")
 
     tr_pairs = []
     for ss in spot_segs:
@@ -289,12 +356,13 @@ def main():
             a = [r for r in ss if lo <= r["t_mono"] <= hi]
             b = [r for r in fs if lo <= r["t_mono"] <= hi]
             tr_pairs += pair_trades(a, b)
-    report(tr_pairs, "口径A'(成交时间戳 T 完全相等，仅 trade/aggTrade 流有效)", off, thr=args.gap_threshold)
+    if tr_pairs:
+        report(tr_pairs, "口径A'(成交时间戳 T 完全相等，仅 trade/aggTrade 流有效)", off, thr=args.gap_threshold)
 
     # 口径B 需要买价字段：只有 bookTicker 流才有（trade 流没有 b 字段则自动跳过）
     if any(r.get("b") is not None for r in msgs["spot"][:200]) and \
        any(r.get("b") is not None for r in msgs["futures"][:200]):
-        report(p_pairs, "口径B(买价跳变事件对齐)", off, thr=args.gap_threshold)
+        report(p_pairs, "口径B(最优买价档位跳变 = 同一冲击事件的两市响应)", off, thr=args.gap_threshold)
     else:
         print("\n===== 口径B 跳过：当前数据流不含买价 b 字段（需 bookTicker 流） =====")
 
@@ -303,7 +371,7 @@ def report(pairs, label, off, thr):
     n = len(pairs)
     print(f"\n===== {label}: 配对样本 n={n} =====")
     if n == 0:
-        print("   无配对样本：请确认两侧都在收流、或增大 --tol-ms / --max-event-gap-ms")
+        print("   无配对样本：请确认两侧都在收流；必要时增大 --tol-ms / --max-event-gap-ms / --level-tol")
         return
 
     d = [(s["t_mono"] - f["t_mono"]) * 1000.0 for s, f in pairs]  # >0: 合约先到; <0: 现货先到
@@ -330,11 +398,20 @@ def report(pairs, label, off, thr):
         print(f"   方向解读：平均而言【现货】比合约早到约 {-md:.1f} ms")
 
     # ---- 端到端延迟（扣除时钟偏移后）----
-    print("\n-- 端到端推送延迟 latency = t_recv_local - ev_ts - server_offset (ms)")
-    for mk, idx in (("spot", 0), ("futures", 1)):
-        lat = sorted((p[idx]["t_wall"] - p[idx]["ev_us"] / 1000.0 - off[mk]) for p in pairs)
-        print(f"   {mk:8s}: p50={pct(lat,0.5):.1f} p90={pct(lat,0.9):.1f} "
-              f"p99={pct(lat,0.99):.1f} max={lat[-1]:.1f}")
+    have_ts = any(p[idx].get("ev_us") for p in pairs for idx in (0, 1))
+    if not have_ts:
+        print("\n-- 端到端推送延迟：本数据为 bookTicker 流，现货侧不带时间戳字段，"
+              "无法计算绝对延迟（改用 trade/aggTrade 流可测）")
+    else:
+        print("\n-- 端到端推送延迟 latency = t_recv_local - ev_ts - server_offset (ms)")
+        for mk, idx in (("spot", 0), ("futures", 1)):
+            lat = sorted((p[idx]["t_wall"] - p[idx]["ev_us"] / 1000.0 - off[mk])
+                         for p in pairs if p[idx].get("ev_us"))
+            if not lat:
+                print(f"   {mk:8s}: 无可用事件时间戳，跳过")
+                continue
+            print(f"   {mk:8s}: p50={pct(lat,0.5):.1f} p90={pct(lat,0.9):.1f} "
+                  f"p99={pct(lat,0.99):.1f} max={lat[-1]:.1f}")
 
     # ---- 按分钟分桶看偏向是否稳定 ----
     buckets = defaultdict(list)
