@@ -8,3 +8,4 @@ latency_probe/data/node_modules/
 dist/
 build/
 *.log
+node_modules/
