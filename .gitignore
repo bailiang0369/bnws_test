@@ -3,7 +3,9 @@ __pycache__/
 *.pyc
 
 # Generated data files
-latency_probe/data/node_modules/
+latency_probe/data/
+*.jsonl
+node_modules/
 .next/
 dist/
 build/
